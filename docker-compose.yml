@@ -1,0 +1,82 @@
+#   docker compose up --build
+# UI: http://localhost:3000   API: http://localhost:8080
+# Postgres primary: localhost:5435   replica: localhost:5436   (user postgres / secret, db postgres)
+# Inside a container 127.0.0.1 is the container itself, so the backend reaches the
+# databases and Redis by service name (postgres-primary, postgres-replica, redis).
+services:
+  postgres-primary:
+    image: docker.io/library/postgres:16
+    environment:
+      POSTGRES_DB: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: secret
+      REPLICATION_PASSWORD: replicator-secret
+    command: ["postgres", "-c", "wal_level=replica", "-c", "max_wal_senders=5", "-c", "max_replication_slots=5"]
+    ports:
+      - "5435:5432"
+    volumes:
+      - pg-primary:/var/lib/postgresql/data
+      - ./docker/postgres/primary-init.sh:/docker-entrypoint-initdb.d/00-replication.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 3s
+      retries: 20
+
+  postgres-replica:
+    image: docker.io/library/postgres:16
+    user: postgres
+    environment:
+      PRIMARY_HOST: host.containers.internal
+      PRIMARY_PORT: "5435"
+      REPLICATION_PASSWORD: replicator-secret
+      PGDATA: /var/lib/postgresql/data/pgdata
+    entrypoint: ["bash", "/replica-entrypoint.sh"]
+    ports:
+      - "5436:5432"
+    volumes:
+      - pg-replica:/var/lib/postgresql/data
+      - ./docker/postgres/replica-entrypoint.sh:/replica-entrypoint.sh:ro
+    depends_on:
+      postgres-primary:
+        condition: service_healthy
+    healthcheck:
+      # Up AND in recovery mode, i.e. really a standby.
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres && psql -U postgres -d postgres -tAc 'select pg_is_in_recovery()' | grep -q t"]
+      interval: 3s
+      retries: 30
+
+  redis:
+    image: docker.io/library/redis:7.4
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      retries: 20
+
+  backend:
+    build: ./tracker
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://host.containers.internal:5435/postgres?sslmode=disable
+      ANTHROPIC_API_KEY:
+      SPRING_DATASOURCE_USERNAME: postgres
+      SPRING_DATASOURCE_PASSWORD: secret
+      APP_DATASOURCE_REPLICA_URL: jdbc:postgresql://host.containers.internal:5436/postgres?sslmode=disable
+      SPRING_DATA_REDIS_HOST: host.containers.internal
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres-primary: { condition: service_healthy }
+      postgres-replica: { condition: service_healthy }
+      redis: { condition: service_healthy }
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+
+volumes:
+  pg-primary:
+  pg-replica:
